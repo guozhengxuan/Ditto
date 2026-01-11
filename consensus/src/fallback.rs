@@ -445,7 +445,7 @@ impl Fallback {
 
             #[cfg(feature = "benchmark")]
             for x in &block.payload {
-                info!("Created B{}({})", block.round, base64::encode(x));
+                info!("Created B{}-{}({})", block.round, block.fallback, base64::encode(x));
             }
         }
         debug!("Created {:?}", block);
@@ -498,7 +498,7 @@ impl Fallback {
 
                 #[cfg(feature = "benchmark")]
                 for x in &current_block.payload {
-                    info!("Committed B{}({})", current_block.round, base64::encode(x));
+                    info!("Committed B{}-{}({})", current_block.round, current_block.fallback, base64::encode(x));
                 }
                 // Cleanup the mempool.
                 self.mempool_driver.cleanup_async(&current_block).await;

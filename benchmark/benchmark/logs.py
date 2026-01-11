@@ -40,7 +40,7 @@ class LogParser:
                 results = p.map(self._parse_nodes, nodes)
         except (ValueError, IndexError) as e:
             raise ParseError(f'Failed to parse node logs: {e}')
-        proposals, commits, sizes, self.received_samples, timeouts, self.configs,d2t_samples \
+        proposals, commits, sizes, self.received_samples, timeouts, self.configs, d2t_samples, fallback_infos \
             = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
@@ -49,6 +49,13 @@ class LogParser:
         }
         self.timeouts = max(timeouts)
         self.d2t_samples = self._merge_results([x.items() for x in d2t_samples])
+
+        # Merge fallback information from all nodes
+        self.fallback_info = {}
+        for fallback_dict in fallback_infos:
+            for digest, fallback_val in fallback_dict.items():
+                if digest not in self.fallback_info:
+                    self.fallback_info[digest] = fallback_val
 
         # Check whether clients missed their target rate.
         if self.misses != 0:
@@ -91,13 +98,17 @@ class LogParser:
         if search(r'panic', log) is not None:
             raise ParseError('Client(s) panicked sb')
 
-        tmp = findall(r'\[(.*Z) .* Created B\d+\(([^ ]+)\)', log)
+        tmp = findall(r'\[(.*Z) .* Created B\d+-\d+\(([^ ]+)\)', log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+\(([^ ]+)\)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        tmp = findall(r'\[(.*Z) .* Committed B(\d+)-(\d+)\(([^ ]+)\)', log)
+        tmp = [(d, self._to_posix(t)) for t, r, f, d in tmp]
         commits = self._merge_results([tmp])
+
+        # Extract fallback information from committed blocks
+        tmp = findall(r'\[(.*Z) .* Committed B(\d+)-(\d+)\(([^ ]+)\)', log)
+        fallback_info = {d: int(f) for t, r, f, d in tmp}
 
         tmp = findall(r'Payload ([^ ]+) contains (\d+) B', log)
         sizes = {d: int(s) for d, s in tmp}
@@ -144,7 +155,7 @@ class LogParser:
             }
         }
 
-        return proposals, commits, sizes, samples, timeouts, configs,d2t_samples
+        return proposals, commits, sizes, samples, timeouts, configs, d2t_samples, fallback_info
 
     def _to_posix(self, string):
         x = datetime.fromisoformat(string.replace('Z', '+00:00'))
@@ -182,14 +193,35 @@ class LogParser:
                     assert tx_id in sent  # We receive txs that we sent.
                     start = sent[tx_id]
                     end = self.commits[batch_id]
-                    latency += [end-start]   
+                    latency += [end-start]
         return mean(latency) if latency else 0
+
+    def _fallback_statistics(self):
+        """Calculate the number and ratio of blocks with fallback 0 and 1."""
+        fallback_0_count = 0
+        fallback_1_count = 0
+
+        for digest in self.commits.keys():
+            if digest in self.fallback_info:
+                if self.fallback_info[digest] == 0:
+                    fallback_0_count += 1
+                elif self.fallback_info[digest] == 1:
+                    fallback_1_count += 1
+
+        total_count = fallback_0_count + fallback_1_count
+        fallback_0_ratio = (fallback_0_count / total_count * 100) if total_count > 0 else 0
+        fallback_1_ratio = (fallback_1_count / total_count * 100) if total_count > 0 else 0
+
+        return fallback_0_count, fallback_1_count, total_count, fallback_0_ratio, fallback_1_ratio
 
     def result(self):
         consensus_latency = self._consensus_latency() * 1000
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1000
+
+        # Get fallback statistics
+        fallback_0_count, fallback_1_count, total_count, fallback_0_ratio, fallback_1_ratio = self._fallback_statistics()
 
         consensus_timeout_delay = self.configs[0]['consensus']['timeout_delay']
         consensus_sync_retry_delay = self.configs[0]['consensus']['sync_retry_delay']
@@ -231,6 +263,11 @@ class LogParser:
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
             f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            '\n'
+            ' + FALLBACK STATISTICS:\n'
+            f' Total committed blocks: {total_count:,}\n'
+            f' Blocks with fallback=0: {fallback_0_count:,} ({fallback_0_ratio:.2f}%)\n'
+            f' Blocks with fallback=1: {fallback_1_count:,} ({fallback_1_ratio:.2f}%)\n'
             '-----------------------------------------\n'
         )
 
@@ -304,7 +341,21 @@ class LogParser:
         content += "\n"
         return content
     
-    def print(self, r_filename,t_filename,l_filename):
+    def fallback_stats(self):
+        """Generate fallback statistics report."""
+        fallback_0_count, fallback_1_count, total_count, fallback_0_ratio, fallback_1_ratio = self._fallback_statistics()
+
+        content = (
+            'FALLBACK STATISTICS\n'
+            '===================\n'
+            f'Total committed blocks: {total_count}\n'
+            f'Blocks with fallback=0: {fallback_0_count} ({fallback_0_ratio:.2f}%)\n'
+            f'Blocks with fallback=1: {fallback_1_count} ({fallback_1_ratio:.2f}%)\n'
+            '\n'
+        )
+        return content
+
+    def print(self, r_filename, t_filename, l_filename, f_filename=None):
         assert isinstance(r_filename, str)
         assert isinstance(t_filename, str)
         with open(r_filename, 'a') as f:
@@ -313,6 +364,10 @@ class LogParser:
             f.write(self.transactionsWithTime())
         with open(l_filename, 'a') as f:
             f.write(self.latencyWithTime())
+        if f_filename is not None:
+            assert isinstance(f_filename, str)
+            with open(f_filename, 'a') as f:
+                f.write(self.fallback_stats())
 
     @classmethod
     def process(cls, directory, faults=0, protocol=0, ddos=False):
